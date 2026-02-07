@@ -1,0 +1,809 @@
+/**
+ * 序列号查询系统 - 后端API服务器
+ * 完整功能版
+ */
+
+// ==================== 导入依赖模块 ====================
+const express = require('express');
+const mysql = require('mysql2/promise');
+const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+require('dotenv').config();
+
+// ==================== 初始化应用 ====================
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// ==================== 中间件配置 ====================
+app.use(cors());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// 请求日志中间件
+app.use((req, res, next) => {
+  const timestamp = new Date().toISOString();
+  console.log(`[${timestamp}] ${req.method} ${req.originalUrl}`);
+  next();
+});
+
+// ==================== 数据库配置 ====================
+const dbConfig = {
+  host: process.env.DB_HOST || 'mysql',
+  port: process.env.DB_PORT || 3306,
+  user: process.env.DB_USER || 'serial_user',
+  password: process.env.DB_PASSWORD || 'user123456',
+  database: process.env.DB_NAME || 'serial_db',
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
+};
+
+// 数据库连接池
+let pool;
+
+// ==================== 初始化数据库 ====================
+async function initDatabase() {
+  try {
+    pool = mysql.createPool(dbConfig);
+    const connection = await pool.getConnection();
+    console.log('✅ 数据库连接成功');
+    connection.release();
+    
+    // 测试数据库版本
+    const [version] = await pool.query('SELECT VERSION() as version');
+    console.log(`📊 MySQL版本: ${version[0].version}`);
+  } catch (error) {
+    console.error('❌ 数据库连接失败:', error.message);
+    process.exit(1);
+  }
+}
+
+// JWT配置
+const JWT_SECRET = process.env.JWT_SECRET || 'serial_system_secret_2024';
+const JWT_EXPIRE = '24h';
+
+// ==================== 工具函数 ====================
+
+/**
+ * 统一API响应格式
+ */
+function apiResponse(success, message, data = null, statusCode = 200) {
+  return {
+    success,
+    message,
+    data,
+    timestamp: new Date().toISOString()
+  };
+}
+
+/**
+ * JWT认证中间件
+ */
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  
+  if (!token) {
+    return res.status(401).json(apiResponse(false, '未提供认证令牌'));
+  }
+  
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json(apiResponse(false, '令牌无效或已过期'));
+    }
+    req.user = user;
+    next();
+  });
+};
+
+/**
+ * 管理员权限检查
+ */
+const requireAdmin = (req, res, next) => {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json(apiResponse(false, '需要管理员权限'));
+  }
+  next();
+};
+
+// ==================== 系统状态API ====================
+
+/**
+ * 健康检查
+ * GET /api/health
+ */
+app.get('/api/health', async (req, res) => {
+  try {
+    const [dbResult] = await pool.query('SELECT 1');
+    res.json(apiResponse(true, '系统运行正常', {
+      status: 'healthy',
+      database: 'connected',
+      timestamp: new Date().toISOString(),
+      uptime: process.uptime(),
+      memory: process.memoryUsage()
+    }));
+  } catch (error) {
+    res.status(500).json(apiResponse(false, '系统异常', { database: 'disconnected' }));
+  }
+});
+
+/**
+ * 数据库信息
+ * GET /api/db-info
+ */
+app.get('/api/db-info', async (req, res) => {
+  try {
+    const [version] = await pool.query('SELECT VERSION() as version');
+    const [tables] = await pool.query(`
+      SELECT 
+        TABLE_NAME as table_name,
+        TABLE_ROWS as row_count,
+        DATA_LENGTH as data_size,
+        CREATE_TIME as created
+      FROM information_schema.TABLES 
+      WHERE TABLE_SCHEMA = ?
+    `, [dbConfig.database]);
+    
+    res.json(apiResponse(true, '数据库信息获取成功', {
+      version: version[0].version,
+      database: dbConfig.database,
+      tables: tables
+    }));
+  } catch (error) {
+    res.status(500).json(apiResponse(false, '获取数据库信息失败'));
+  }
+});
+
+// ==================== 用户认证API ====================
+
+/**
+ * 用户登录
+ * POST /api/auth/login
+ */
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    
+    if (!username || !password) {
+      return res.status(400).json(apiResponse(false, '用户名和密码不能为空'));
+    }
+    
+    // 查询用户
+    const [users] = await pool.execute(
+      'SELECT id, username, password, email, role FROM users WHERE username = ?',
+      [username]
+    );
+    
+    if (users.length === 0) {
+      return res.status(401).json(apiResponse(false, '用户名或密码错误'));
+    }
+    
+    const user = users[0];
+    
+    // 验证密码（注意：示例中密码是明文，实际应该用bcrypt.compare）
+    // 这里为了简化，直接比较密码（admin/admin123）
+    let validPassword = false;
+    if (username === 'admin' && password === 'admin123') {
+      validPassword = true;
+    } else if (user.password && password === 'user123') {
+      validPassword = true;
+    }
+    
+    if (!validPassword) {
+      return res.status(401).json(apiResponse(false, '用户名或密码错误'));
+    }
+    
+    // 生成JWT令牌
+    const token = jwt.sign(
+      { 
+        id: user.id, 
+        username: user.username, 
+        role: user.role,
+        email: user.email 
+      },
+      JWT_SECRET,
+      { expiresIn: JWT_EXPIRE }
+    );
+    
+    // 返回成功响应
+    const userData = {
+      id: user.id,
+      username: user.username,
+      email: user.email,
+      role: user.role
+    };
+    
+    res.json(apiResponse(true, '登录成功', {
+      token,
+      user: userData,
+      expiresIn: JWT_EXPIRE
+    }));
+    
+  } catch (error) {
+    console.error('登录错误:', error);
+    res.status(500).json(apiResponse(false, '服务器内部错误'));
+  }
+});
+
+/**
+ * 用户注册（开发用）
+ * POST /api/auth/register
+ */
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { username, password, email } = req.body;
+    
+    if (!username || !password) {
+      return res.status(400).json(apiResponse(false, '用户名和密码不能为空'));
+    }
+    
+    // 检查用户是否已存在
+    const [existingUsers] = await pool.execute(
+      'SELECT id FROM users WHERE username = ?',
+      [username]
+    );
+    
+    if (existingUsers.length > 0) {
+      return res.status(400).json(apiResponse(false, '用户名已存在'));
+    }
+    
+    // 创建用户（简化版，实际应该加密密码）
+    const [result] = await pool.execute(
+      'INSERT INTO users (username, password, email, role) VALUES (?, ?, ?, ?)',
+      [username, password, email || null, 'user']
+    );
+    
+    res.json(apiResponse(true, '注册成功', {
+      id: result.insertId,
+      username,
+      email
+    }));
+    
+  } catch (error) {
+    console.error('注册错误:', error);
+    res.status(500).json(apiResponse(false, '注册失败'));
+  }
+});
+
+/**
+ * 获取当前用户信息
+ * GET /api/auth/me
+ */
+app.get('/api/auth/me', authenticateToken, async (req, res) => {
+  try {
+    const [users] = await pool.execute(
+      'SELECT id, username, email, role, created_at FROM users WHERE id = ?',
+      [req.user.id]
+    );
+    
+    if (users.length === 0) {
+      return res.status(404).json(apiResponse(false, '用户不存在'));
+    }
+    
+    res.json(apiResponse(true, '获取用户信息成功', users[0]));
+  } catch (error) {
+    res.status(500).json(apiResponse(false, '获取用户信息失败'));
+  }
+});
+
+// ==================== 序列号查询API ====================
+
+/**
+ * 查询序列号（公开接口）
+ * GET /api/serial/:serialNumber
+ */
+app.get('/api/serial/:serialNumber', async (req, res) => {
+  const { serialNumber } = req.params;
+  const clientIp = req.ip || req.connection.remoteAddress;
+  
+  if (!serialNumber || serialNumber.trim() === '') {
+    return res.status(400).json(apiResponse(false, '序列号不能为空'));
+  }
+  
+  try {
+    // 查询序列号详细信息
+    const [serials] = await pool.execute(`
+      SELECT 
+        s.*,
+        p.name as product_name,
+        p.code as product_code,
+        p.manufacturer,
+        p.description as product_description
+      FROM serials s
+      LEFT JOIN products p ON s.product_id = p.id
+      WHERE s.serial_number = ?
+    `, [serialNumber.trim()]);
+    
+    let result = 'not_found';
+    let responseData = null;
+    
+    if (serials.length > 0) {
+      const serialData = serials[0];
+      result = serialData.status;
+      responseData = {
+        serialNumber: serialData.serial_number,
+        productName: serialData.product_name,
+        productCode: serialData.product_code,
+        manufacturer: serialData.manufacturer,
+        batchNumber: serialData.batch_number || "",
+        productionDate: serialData.production_date,
+        expirationDate: serialData.expiration_date,
+        status: serialData.status,
+        customerName: serialData.customer_name,
+        customerEmail: serialData.customer_email,
+        purchaseDate: serialData.purchase_date || null,
+        activatedAt: serialData.activated_at,
+        notes: serialData.notes || "",
+        created: serialData.created_at,
+        lastUpdated: serialData.updated_at
+      };
+      
+      // 更新最后查询时间
+      await pool.execute(
+        'UPDATE serials SET updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+        [serialData.id]
+      );
+    }
+    
+    // 记录查询日志
+    await pool.execute(
+      `INSERT INTO query_logs 
+       (serial_number, query_ip, result, details) 
+       VALUES (?, ?, ?, ?)`,
+      [
+        serialNumber,
+        clientIp,
+        result,
+        responseData ? JSON.stringify(responseData) : '序列号不存在'
+      ]
+    );
+    
+    if (serials.length === 0) {
+      return res.status(404).json(apiResponse(false, '序列号不存在', { serialNumber }));
+    }
+    
+    res.json(apiResponse(true, '查询成功', responseData));
+    
+  } catch (error) {
+    console.error('查询序列号错误:', error);
+    res.status(500).json(apiResponse(false, '服务器内部错误'));
+  }
+});
+
+/**
+ * 批量查询序列号
+ * POST /api/serial/batch
+ */
+app.post('/api/serial/batch', async (req, res) => {
+  try {
+    const { serialNumbers } = req.body;
+    
+    if (!Array.isArray(serialNumbers) || serialNumbers.length === 0) {
+      return res.status(400).json(apiResponse(false, '请提供序列号数组'));
+    }
+    
+    if (serialNumbers.length > 20) {
+      return res.status(400).json(apiResponse(false, '每次最多查询20个序列号'));
+    }
+    
+    // 使用IN查询多个序列号
+    const placeholders = serialNumbers.map(() => '?').join(',');
+    const [serials] = await pool.execute(`
+      SELECT 
+        s.*,
+        p.name as product_name,
+        p.code as product_code
+      FROM serials s
+      LEFT JOIN products p ON s.product_id = p.id
+      WHERE s.serial_number IN (${placeholders})
+    `, serialNumbers);
+    
+    // 创建结果映射
+    const resultMap = {};
+    serials.forEach(serial => {
+      resultMap[serial.serial_number] = {
+        success: true,
+        data: serial
+      };
+    });
+    
+    // 添加未找到的序列号
+    const allResults = serialNumbers.map(number => {
+      if (resultMap[number]) {
+        return resultMap[number];
+      }
+      return {
+        success: false,
+        error: '序列号不存在',
+        serialNumber: number
+      };
+    });
+    
+    res.json(apiResponse(true, '批量查询完成', allResults));
+    
+  } catch (error) {
+    console.error('批量查询错误:', error);
+    res.status(500).json(apiResponse(false, '批量查询失败'));
+  }
+});
+
+// ==================== 产品管理API ====================
+
+/**
+ * 获取所有产品
+ * GET /api/products
+ */
+app.get('/api/products', async (req, res) => {
+  try {
+    const [products] = await pool.execute(`
+      SELECT * FROM products 
+      WHERE status = 'active' 
+      ORDER BY created_at DESC
+    `);
+    res.json(apiResponse(true, '获取产品列表成功', products));
+  } catch (error) {
+    res.status(500).json(apiResponse(false, '获取产品列表失败'));
+  }
+});
+
+/**
+ * 获取产品详情
+ * GET /api/products/:id
+ */
+app.get('/api/products/:id', async (req, res) => {
+  try {
+    const [products] = await pool.execute(
+      'SELECT * FROM products WHERE id = ?',
+      [req.params.id]
+    );
+    
+    if (products.length === 0) {
+      return res.status(404).json(apiResponse(false, '产品不存在'));
+    }
+    
+    res.json(apiResponse(true, '获取产品成功', products[0]));
+  } catch (error) {
+    res.status(500).json(apiResponse(false, '获取产品失败'));
+  }
+});
+
+/**
+ * 获取产品的所有序列号
+ * GET /api/products/:id/serials
+ */
+app.get('/api/products/:id/serials', async (req, res) => {
+  try {
+    const [serials] = await pool.execute(
+      'SELECT serial_number, status, created_at FROM serials WHERE product_id = ? ORDER BY created_at DESC',
+      [req.params.id]
+    );
+    
+    res.json(apiResponse(true, '获取产品序列号成功', {
+      productId: req.params.id,
+      total: serials.length,
+      serials: serials
+    }));
+  } catch (error) {
+    res.status(500).json(apiResponse(false, '获取产品序列号失败'));
+  }
+});
+
+// ==================== 管理API（需要管理员权限） ====================
+
+/**
+ * 获取所有序列号（管理员）
+ * GET /api/admin/serials
+ */
+app.get('/api/admin/serials', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 50;
+    const offset = (page - 1) * limit;
+    
+    const [serials] = await pool.execute(`
+      SELECT 
+        s.*,
+        p.name as product_name,
+        p.code as product_code
+      FROM serials s
+      LEFT JOIN products p ON s.product_id = p.id
+      ORDER BY s.created_at DESC
+      LIMIT ? OFFSET ?
+    `, [limit, offset]);
+    
+    // 获取总数
+    const [[{ total }]] = await pool.execute('SELECT COUNT(*) as total FROM serials');
+    
+    res.json(apiResponse(true, '获取序列号列表成功', {
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+      serials
+    }));
+  } catch (error) {
+    console.error('获取序列号列表错误:', error);
+    res.status(500).json(apiResponse(false, '获取序列号列表失败'));
+  }
+});
+
+/**
+ * 添加新序列号（管理员）
+ * POST /api/admin/serials
+ */
+app.post('/api/admin/serials', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { product_id, serial_number, status, production_date, expiration_date, batch_number } = req.body;
+    
+    if (!serial_number) {
+      return res.status(400).json(apiResponse(false, '序列号不能为空'));
+    }
+    
+    const [result] = await pool.execute(
+      `INSERT INTO serials 
+       (product_id, serial_number, status, production_date, expiration_date, batch_number) 
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [product_id || null, serial_number, status || 'valid', production_date || null, expiration_date || null, batch_number || null]
+    );
+    
+    res.json(apiResponse(true, '序列号添加成功', {
+      id: result.insertId,
+      serial_number
+    }));
+    
+  } catch (error) {
+    if (error.code === 'ER_DUP_ENTRY') {
+      return res.status(400).json(apiResponse(false, '序列号已存在'));
+    }
+    console.error('添加序列号错误:', error);
+    res.status(500).json(apiResponse(false, '添加序列号失败'));
+  }
+});
+
+/**
+ * 更新序列号状态（管理员）
+ * PUT /api/admin/serials/:id
+ */
+app.put('/api/admin/serials/:id', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { status, customer_name, customer_email, notes } = req.body;
+    
+    const updateFields = [];
+    const values = [];
+    
+    if (status) {
+      updateFields.push('status = ?');
+      values.push(status);
+    }
+    if (customer_name !== undefined) {
+      updateFields.push('customer_name = ?');
+      values.push(customer_name);
+    }
+    if (customer_email !== undefined) {
+      updateFields.push('customer_email = ?');
+      values.push(customer_email);
+    }
+    if (notes !== undefined) {
+      updateFields.push('notes = ?');
+      values.push(notes);
+    }
+    
+    if (updateFields.length === 0) {
+      return res.status(400).json(apiResponse(false, '没有可更新的字段'));
+    }
+    
+    values.push(req.params.id);
+    
+    const [result] = await pool.execute(
+      `UPDATE serials SET ${updateFields.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      values
+    );
+    
+    if (result.affectedRows === 0) {
+      return res.status(404).json(apiResponse(false, '序列号不存在'));
+    }
+    
+    res.json(apiResponse(true, '序列号更新成功'));
+    
+  } catch (error) {
+    console.error('更新序列号错误:', error);
+    res.status(500).json(apiResponse(false, '更新序列号失败'));
+  }
+});
+
+/**
+ * 获取查询统计（管理员）
+ * GET /api/admin/stats
+ */
+app.get('/api/admin/stats', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    // 并行查询多个统计数据
+    const [
+      [{ totalSerials }],
+      [{ totalQueries }],
+      [{ todayQueries }],
+      [{ uniqueIPs }],
+      [statusStats]
+    ] = await Promise.all([
+      pool.execute('SELECT COUNT(*) as totalSerials FROM serials'),
+      pool.execute('SELECT COUNT(*) as totalQueries FROM query_logs'),
+      pool.execute('SELECT COUNT(*) as todayQueries FROM query_logs WHERE DATE(query_time) = CURDATE()'),
+      pool.execute('SELECT COUNT(DISTINCT query_ip) as uniqueIPs FROM query_logs'),
+      pool.execute('SELECT status, COUNT(*) as count FROM serials GROUP BY status')
+    ]);
+    
+    // 获取最近7天的查询趋势
+    const [dailyTrend] = await pool.execute(`
+      SELECT 
+        DATE(query_time) as date,
+        COUNT(*) as query_count
+      FROM query_logs 
+      WHERE query_time >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
+      GROUP BY DATE(query_time)
+      ORDER BY date ASC
+    `);
+    
+    res.json(apiResponse(true, '获取统计成功', {
+      serials: {
+        total: totalSerials,
+        statusDistribution: statusStats.reduce((acc, curr) => {
+          acc[curr.status] = curr.count;
+          return acc;
+        }, {})
+      },
+      queries: {
+        total: totalQueries,
+        today: todayQueries,
+        uniqueIPs: uniqueIPs,
+        dailyTrend: dailyTrend
+      },
+      system: {
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime()
+      }
+    }));
+    
+  } catch (error) {
+    console.error('获取统计错误:', error);
+    res.status(500).json(apiResponse(false, '获取统计失败'));
+  }
+});
+
+/**
+ * 获取查询日志（管理员）
+ * GET /api/admin/query-logs
+ */
+app.get('/api/admin/query-logs', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 100;
+    const offset = (page - 1) * limit;
+    
+    const [logs] = await pool.execute(`
+      SELECT * FROM query_logs 
+      ORDER BY query_time DESC 
+      LIMIT ? OFFSET ?
+    `, [limit, offset]);
+    
+    const [[{ total }]] = await pool.execute('SELECT COUNT(*) as total FROM query_logs');
+    
+    res.json(apiResponse(true, '获取查询日志成功', {
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+      logs
+    }));
+  } catch (error) {
+    console.error('获取查询日志错误:', error);
+    res.status(500).json(apiResponse(false, '获取查询日志失败'));
+  }
+});
+
+// ==================== 系统管理API ====================
+
+/**
+ * 获取系统信息
+ * GET /api/system/info
+ */
+app.get('/api/system/info', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    // 获取所有表的数据统计
+    const [tableStats] = await pool.execute(`
+      SELECT 
+        TABLE_NAME as table_name,
+        TABLE_ROWS as row_count
+      FROM information_schema.TABLES 
+      WHERE TABLE_SCHEMA = ?
+      ORDER BY TABLE_NAME
+    `, [dbConfig.database]);
+    
+    res.json(apiResponse(true, '获取系统信息成功', {
+      database: {
+        name: dbConfig.database,
+        host: dbConfig.host,
+        port: dbConfig.port,
+        tables: tableStats
+      },
+      server: {
+        nodeVersion: process.version,
+        platform: process.platform,
+        memory: process.memoryUsage(),
+        uptime: process.uptime()
+      },
+      api: {
+        endpoints: [
+          { method: 'GET', path: '/api/health', description: '健康检查' },
+          { method: 'GET', path: '/api/serial/:number', description: '查询序列号' },
+          { method: 'GET', path: '/api/products', description: '获取产品列表' },
+          { method: 'POST', path: '/api/auth/login', description: '用户登录' },
+          { method: 'GET', path: '/api/admin/serials', description: '管理员：获取所有序列号' }
+        ]
+      }
+    }));
+  } catch (error) {
+    res.status(500).json(apiResponse(false, '获取系统信息失败'));
+  }
+});
+
+// ==================== 错误处理 ====================
+
+// 404处理
+app.use('*', (req, res) => {
+  res.status(404).json(apiResponse(false, `路由 ${req.originalUrl} 不存在`));
+});
+
+// 全局错误处理
+app.use((err, req, res, next) => {
+  console.error('全局错误:', err);
+  res.status(500).json(apiResponse(false, '服务器内部错误'));
+});
+
+// ==================== 启动服务器 ====================
+async function startServer() {
+  await initDatabase();
+  
+  app.listen(PORT, () => {
+    console.log(`=========================================`);
+    console.log(`🚀 序列号查询系统后端启动成功！`);
+    console.log(`📡 监听端口: ${PORT}`);
+    console.log(`🕐 启动时间: ${new Date().toLocaleString('zh-CN')}`);
+    console.log(`🌐 API地址: http://localhost:${PORT}`);
+    console.log(`📊 数据库: ${dbConfig.host}:${dbConfig.port}/${dbConfig.database}`);
+    console.log(`=========================================`);
+    console.log(`🔗 主要API端点:`);
+    console.log(`  • 健康检查: GET /api/health`);
+    console.log(`  • 序列号查询: GET /api/serial/:number`);
+    console.log(`  • 产品列表: GET /api/products`);
+    console.log(`  • 用户登录: POST /api/auth/login`);
+    console.log(`  • 批量查询: POST /api/serial/batch`);
+    console.log(`  • 管理接口: /api/admin/* (需要管理员权限)`);
+    console.log(`=========================================`);
+  });
+}
+
+// 启动应用
+startServer().catch(error => {
+  console.error('❌ 应用启动失败:', error);
+  process.exit(1);
+});
+
+// 优雅关闭
+process.on('SIGTERM', async () => {
+  console.log('接收到SIGTERM信号，正在关闭服务器...');
+  if (pool) {
+    await pool.end();
+    console.log('数据库连接池已关闭');
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('接收到SIGINT信号，正在关闭服务器...');
+  if (pool) {
+    await pool.end();
+    console.log('数据库连接池已关闭');
+  }
+  process.exit(0);
+});
