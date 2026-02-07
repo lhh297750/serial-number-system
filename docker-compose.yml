@@ -18,11 +18,7 @@ services:
       - ./mysql/conf.d:/etc/mysql/conf.d
       - mysql_data:/var/lib/mysql
       - ./mysql/init.sql:/docker-entrypoint-initdb.d/init.sql
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+    # 没有 healthcheck
 
   backend:
     build: ./backend
@@ -37,9 +33,10 @@ services:
       DB_PASSWORD: user123456
       DB_NAME: serial_db
       JWT_SECRET: serial_system_secret_2024
+    # 移除 depends_on 的健康检查条件
     depends_on:
-      mysql:
-        condition: service_healthy
+      - mysql
+    # 没有 healthcheck
     volumes:
       - ./backend:/app
       - /app/node_modules
